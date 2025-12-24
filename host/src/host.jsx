@@ -166,7 +166,7 @@ const HostApp = () => {
     setRoomId(id);
   };
 
-  const joinOrCreateRoom = async () => {
+const joinOrCreateRoom = async () => {
   if (!userName.trim()) {
     setError('กรุณากรอกชื่อของคุณ');
     return;
@@ -226,6 +226,28 @@ const HostApp = () => {
     setError('ไม่สามารถเปิดกล้องหรือไมโครโฟนได้: ' + err.message);
     setConnectionStatus('ready');
   }
+
+  // บันทึก hostPeerId ทันทีหลัง peer พร้อม
+  const roomPath = `${selectedLocation.id}/rooms/${roomId}`;
+  const roomRef = ref(database, roomPath);
+
+  await set(roomRef, {
+    hostPeerId: myPeerId,
+    hostName: userName,
+    createdAt: Date.now(),
+    locationName: selectedLocation.name,
+    participants: {} // เริ่มต้นว่าง
+  });
+
+  // ฟังเมื่อมี client เข้ามาใหม่
+  onValue(ref(database, `${roomPath}/participants`), (snap) => {
+    const clients = snap.val() || {};
+    Object.keys(clients).forEach(clientPeerId => {
+      if (!callsRef.current[clientPeerId]) {
+        callPeer(clientPeerId, clients[clientPeerId].name);
+      }
+    });
+  });
 };
 
   const callPeer = async (peerId, peerName) => {

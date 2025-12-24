@@ -3,7 +3,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Video, VideoOff, Mic, MicOff, PhoneOff, Users, LogOut, User, Building2 } from 'lucide-react';
 
 import { database } from './firebase';
-import { ref, get, onValue } from 'firebase/database';
+import { ref, get, onValue, off } from 'firebase/database';
 
 const ClientApp = () => {
   const [userName, setUserName] = useState('');
@@ -26,18 +26,22 @@ const ClientApp = () => {
   const roomStateRef = useRef({ hostPeerId: null, participants: [] });
   const roomHostListenerRef = useRef(null);
 
+  // โหลดข้อมูลจาก localStorage
   useEffect(() => {
     const savedLocation = localStorage.getItem('selectedLocation');
     if (savedLocation) {
       try {
         setSelectedLocation(JSON.parse(savedLocation));
-      } catch (e) {}
+      } catch (e) {
+        console.error('Error parsing selectedLocation', e);
+      }
     }
 
     const savedName = localStorage.getItem('full_name_th') || localStorage.getItem('username');
     if (savedName) setUserName(savedName);
   }, []);
 
+  // โหลดรายการห้อง
   useEffect(() => {
     if (selectedLocation) {
       setLoadingRooms(true);
@@ -52,9 +56,13 @@ const ClientApp = () => {
         setLoadingRooms(false);
       });
       return () => unsubscribe();
+    } else {
+      setAvailableRooms([]);
+      setLoadingRooms(false);
     }
   }, [selectedLocation]);
 
+  // PeerJS initialization
   useEffect(() => {
     const script = document.createElement('script');
     script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js';
@@ -62,9 +70,7 @@ const ClientApp = () => {
     script.onload = initializePeer;
     document.body.appendChild(script);
 
-    return () => {
-      cleanup();
-    };
+    return () => cleanup();
   }, []);
 
   const initializePeer = () => {
@@ -94,6 +100,8 @@ const ClientApp = () => {
           localStreamRef.current = stream;
           if (localVideoRef.current) localVideoRef.current.srcObject = stream;
         } catch (err) {
+          console.error('getUserMedia error:', err);
+          setError('ไม่สามารถเปิดกล้อง/ไมค์ได้');
           return;
         }
       }
@@ -108,8 +116,9 @@ const ClientApp = () => {
     peer.on('connection', (conn) => setupDataConnection(conn));
 
     peer.on('error', (err) => {
-      if (err.type === 'peer-unavailable') setError('ไม่พบผู้ใช้ที่ต้องการเชื่อมต่อ');
-      else setError('เกิดข้อผิดพลาด: ' + err.message);
+      console.error('Peer error:', err);
+      if (err.type === 'peer-unavailable') setError('ไม่พบ Host หรือห้องถูกปิด');
+      else setError('เกิดข้อผิดพลาด PeerJS: ' + err.message);
     });
 
     peerRef.current = peer;
@@ -126,18 +135,12 @@ const ClientApp = () => {
     switch (type) {
       case 'room-state':
         roomStateRef.current = payload;
-        setParticipants(payload.participants);
-        payload.participants.forEach(p => {
-          if (p.peerId !== myPeerId && !callsRef.current[p.peerId]) {
-            setTimeout(() => callPeer(p.peerId, p.name), 500);
-          }
-        });
+        setParticipants(payload.participants || []);
         break;
       case 'participant-joined':
         if (!roomStateRef.current.participants.find(p => p.peerId === payload.peerId)) {
           roomStateRef.current.participants.push(payload);
           setParticipants([...roomStateRef.current.participants]);
-          if (payload.peerId !== myPeerId) setTimeout(() => callPeer(payload.peerId, payload.name), 500);
         }
         break;
       case 'participant-left':
@@ -164,14 +167,22 @@ const ClientApp = () => {
       setError('กรุณากรอกชื่อของคุณ');
       return;
     }
+    if (!selectedLocation) {
+      setError('ยังไม่ได้เลือกสถานที่');
+      return;
+    }
 
     try {
       setConnectionStatus('connecting');
       setError('');
 
+      // เปิดกล้อง/ไมค์ทันที
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localStreamRef.current = stream;
-      if (localVideoRef.current) localVideoRef.current.srcObject = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(e => console.warn('Local video play error:', e));
+      }
 
       const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
       const roomRef = ref(database, roomPath);
@@ -179,18 +190,26 @@ const ClientApp = () => {
       const snapshot = await get(roomRef);
       const hostPeerId = snapshot.val()?.hostPeerId;
 
-      if (hostPeerId) {
-        const dataConn = peerRef.current.connect(hostPeerId, { reliable: true, metadata: { name: userName, roomId: targetRoomId } });
-        setupDataConnection(dataConn);
-
-        dataConn.on('open', () => {
-          dataConn.send({
-            type: 'join-request',
-            payload: { peerId: myPeerId, name: userName, isHost: false }
-          });
-          callPeer(hostPeerId, 'Host');
-        });
+      if (!hostPeerId) {
+        setError('ไม่พบห้องนี้หรือ Host ออกไปแล้ว');
+        setConnectionStatus('ready');
+        return;
       }
+
+      // เชื่อมต่อกับ Host
+      const dataConn = peerRef.current.connect(hostPeerId, {
+        reliable: true,
+        metadata: { name: userName, roomId: targetRoomId }
+      });
+      setupDataConnection(dataConn);
+
+      dataConn.on('open', () => {
+        dataConn.send({
+          type: 'join-request',
+          payload: { peerId: myPeerId, name: userName, isHost: false }
+        });
+        callPeer(hostPeerId, 'Host');
+      });
 
       setIsInRoom(true);
       setConnectionStatus('connected');
@@ -204,19 +223,52 @@ const ClientApp = () => {
       });
 
     } catch (err) {
-      setError('ไม่สามารถเข้าถึงกล้อง/ไมค์: ' + err.message);
+      console.error('Join error:', err);
+      setError('ไม่สามารถเข้าห้องได้: ' + err.message);
       setConnectionStatus('ready');
     }
+
+    const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
+    const roomRef = ref(database, roomPath);
+
+    const snapshot = await get(roomRef);
+    const hostPeerId = snapshot.val()?.hostPeerId;
+
+    if (!hostPeerId) {
+      setError('ไม่พบห้องนี้');
+      return;
+    }
+
+    // บันทึกตัวเองเป็น participant
+    await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
+      name: userName,
+      joinedAt: Date.now()
+    });
+
+    // เชื่อมต่อกับ host
+    const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
+    setupDataConnection(dataConn);
+
+    // โทรหา host
+    callPeer(hostPeerId, 'Host');
+
+    setIsInRoom(true);
   };
 
   const callPeer = async (peerId, peerName) => {
     if (callsRef.current[peerId]) return;
 
-    const call = peerRef.current.call(peerId, localStreamRef.current, { metadata: { name: userName } });
-    callsRef.current[peerId] = call;
+    try {
+      const call = peerRef.current.call(peerId, localStreamRef.current, {
+        metadata: { name: userName }
+      });
+      callsRef.current[peerId] = call;
 
-    call.on('stream', (remoteStream) => addRemoteStream(peerId, remoteStream, { name: peerName }));
-    call.on('close', () => delete callsRef.current[peerId]);
+      call.on('stream', (remoteStream) => addRemoteStream(peerId, remoteStream, { name: peerName }));
+      call.on('close', () => removeParticipant(peerId));
+    } catch (err) {
+      console.error('Call error:', err);
+    }
   };
 
   const addRemoteStream = (peerId, stream, metadata) => {
@@ -387,7 +439,7 @@ const ClientApp = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-6">
             <User className="w-10 h-10 text-blue-400" />
-            <span className="text-white text-4xl font-mono font-bold">{roomId}</span>
+            <span className="text-white text-4xl font-mono font-bold">{roomId || 'กำลังเชื่อมต่อ...'}</span>
           </div>
           <div className="flex items-center gap-6">
             <Users className="w-10 h-10 text-gray-400" />
