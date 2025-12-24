@@ -1,6 +1,6 @@
 // src/settings.jsx
 import React, { useState, useEffect } from 'react';
-import { Plus, Trash2, Building2, AlertCircle, Loader2, Search, CheckCircle2, MapPin, Eye, X, Settings as SettingsIcon } from 'lucide-react';
+import { Plus, Trash2, Building2, AlertCircle, Loader2, Search, CheckCircle2, MapPin, Eye, X } from 'lucide-react';
 
 import { database } from './firebase';
 import { ref, onValue, set, remove } from 'firebase/database';
@@ -146,13 +146,14 @@ const Settings = ({ onClose, onSelectLocation }) => {
   };
 
   const handleSelectLocation = (location) => {
-    onSelectLocation(location); // <-- สำคัญมาก! ส่งสถานที่กลับไป host.jsx
-    onClose(); // ปิด modal
+    localStorage.setItem('selectedLocation', JSON.stringify(location));
+    if (onSelectLocation) onSelectLocation(location);
+    window.location.href = '/'; // <-- Redirect กลับไปหน้า client หลัก
   };
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 p-4">
-      <div className="bg-white rounded-3xl shadow-2xl max-w-6xl w-full max-h-[90vh] overflow-y-auto p-8">
+      <div className="bg-white rounded-3xl shadow-2xl max-w-6xl w-full max-h-[90vh] overflow-y-auto p-10">
         <div className="flex justify-between items-center mb-8">
           <h1 className="text-5xl font-bold text-gray-800 flex items-center gap-6">
             <SettingsIcon className="w-16 h-16 text-emerald-600" />
@@ -230,7 +231,7 @@ const Settings = ({ onClose, onSelectLocation }) => {
                     ดูรายละเอียด
                   </button>
                   <button
-                    onClick={() => handleSelectLocation(loc)}  // <-- เรียกฟังก์ชันนี้เพื่อส่งกลับ
+                    onClick={() => handleSelectLocation(loc)}
                     className="flex-1 py-5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-2xl text-2xl font-bold flex items-center justify-center gap-4 transition shadow-lg"
                   >
                     <CheckCircle2 className="w-10 h-10" />

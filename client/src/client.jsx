@@ -1,9 +1,10 @@
-// src/client.jsx
 import React, { useState, useEffect, useRef } from 'react';
-import { Video, VideoOff, Mic, MicOff, PhoneOff, Users, LogOut, User, Building2 } from 'lucide-react';
+import { Video, VideoOff, Mic, MicOff, PhoneOff, Users, LogOut, User, Building2, Settings } from 'lucide-react';
 
 import { database } from './firebase';
-import { ref, get, onValue, off } from 'firebase/database';
+import { ref, get, onValue, off, set, remove } from 'firebase/database';
+
+import LocationSettings from './LocationSettings';
 
 const ClientApp = () => {
   const [userName, setUserName] = useState('');
@@ -17,6 +18,8 @@ const ClientApp = () => {
   const [selectedLocation, setSelectedLocation] = useState(null);
   const [availableRooms, setAvailableRooms] = useState([]);
   const [loadingRooms, setLoadingRooms] = useState(false);
+  const [roomId, setRoomId] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
 
   const localVideoRef = useRef(null);
   const peerRef = useRef(null);
@@ -26,7 +29,6 @@ const ClientApp = () => {
   const roomStateRef = useRef({ hostPeerId: null, participants: [] });
   const roomHostListenerRef = useRef(null);
 
-  // โหลดข้อมูลจาก localStorage
   useEffect(() => {
     const savedLocation = localStorage.getItem('selectedLocation');
     if (savedLocation) {
@@ -41,7 +43,6 @@ const ClientApp = () => {
     if (savedName) setUserName(savedName);
   }, []);
 
-  // โหลดรายการห้อง
   useEffect(() => {
     if (selectedLocation) {
       setLoadingRooms(true);
@@ -62,7 +63,16 @@ const ClientApp = () => {
     }
   }, [selectedLocation]);
 
-  // PeerJS initialization
+  // อัปเดตวิดีโอ local เมื่อ stream พร้อม
+  useEffect(() => {
+    if (localStreamRef.current && localVideoRef.current) {
+      localVideoRef.current.srcObject = localStreamRef.current;
+      localVideoRef.current.muted = true;
+      localVideoRef.current.play().catch(e => console.warn('Local video play error:', e));
+    }
+  }, [localStreamRef.current]);
+
+  // PeerJS initialization - สร้างแค่ครั้งเดียวตอน mount
   useEffect(() => {
     const script = document.createElement('script');
     script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js';
@@ -70,8 +80,14 @@ const ClientApp = () => {
     script.onload = initializePeer;
     document.body.appendChild(script);
 
-    return () => cleanup();
-  }, []);
+    // Cleanup เฉพาะเมื่อ unmount (ไม่ destroy peer เมื่อออกห้อง)
+    return () => {
+      script.remove();
+      if (peerRef.current && !peerRef.current.destroyed) {
+        peerRef.current.destroy();
+      }
+    };
+  }, []); // [] = run once on mount
 
   const initializePeer = () => {
     const peer = new window.Peer({
@@ -176,7 +192,6 @@ const ClientApp = () => {
       setConnectionStatus('connecting');
       setError('');
 
-      // เปิดกล้อง/ไมค์ทันที
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       localStreamRef.current = stream;
       if (localVideoRef.current) {
@@ -196,20 +211,17 @@ const ClientApp = () => {
         return;
       }
 
-      // เชื่อมต่อกับ Host
-      const dataConn = peerRef.current.connect(hostPeerId, {
-        reliable: true,
-        metadata: { name: userName, roomId: targetRoomId }
+      await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
+        name: userName,
+        joinedAt: Date.now()
       });
+
+      const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
       setupDataConnection(dataConn);
 
-      dataConn.on('open', () => {
-        dataConn.send({
-          type: 'join-request',
-          payload: { peerId: myPeerId, name: userName, isHost: false }
-        });
-        callPeer(hostPeerId, 'Host');
-      });
+      callPeer(hostPeerId, 'Host');
+
+      setRoomId(targetRoomId);
 
       setIsInRoom(true);
       setConnectionStatus('connected');
@@ -227,32 +239,6 @@ const ClientApp = () => {
       setError('ไม่สามารถเข้าห้องได้: ' + err.message);
       setConnectionStatus('ready');
     }
-
-    const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
-    const roomRef = ref(database, roomPath);
-
-    const snapshot = await get(roomRef);
-    const hostPeerId = snapshot.val()?.hostPeerId;
-
-    if (!hostPeerId) {
-      setError('ไม่พบห้องนี้');
-      return;
-    }
-
-    // บันทึกตัวเองเป็น participant
-    await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
-      name: userName,
-      joinedAt: Date.now()
-    });
-
-    // เชื่อมต่อกับ host
-    const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
-    setupDataConnection(dataConn);
-
-    // โทรหา host
-    callPeer(hostPeerId, 'Host');
-
-    setIsInRoom(true);
   };
 
   const callPeer = async (peerId, peerName) => {
@@ -311,18 +297,19 @@ const ClientApp = () => {
   };
 
   const cleanup = () => {
+    // ไม่ destroy peer ที่นี่ เพื่อให้ใช้ต่อได้ตอนเข้าใหม่
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop());
+      localStreamRef.current = null;
     }
     Object.values(callsRef.current).forEach(call => {
       if (call.close) call.close();
     });
+    callsRef.current = {};
     Object.values(dataConnectionsRef.current).forEach(conn => {
       if (conn.close) conn.close();
     });
-    if (peerRef.current && !peerRef.current.destroyed) {
-      peerRef.current.destroy();
-    }
+    dataConnectionsRef.current = {};
     if (roomHostListenerRef.current) {
       off(roomHostListenerRef.current);
       roomHostListenerRef.current = null;
@@ -330,7 +317,11 @@ const ClientApp = () => {
   };
 
   const leaveRoom = async (notifyOthers = true) => {
-    if (notifyOthers) {
+    if (notifyOthers && roomId && selectedLocation && myPeerId) {
+      const roomPath = `${selectedLocation.id}/rooms/${roomId}`;
+      const participantRef = ref(database, `${roomPath}/participants/${myPeerId}`);
+      await remove(participantRef).catch(err => console.error('Failed to remove participant:', err));
+
       sendToHost({
         type: 'participant-left',
         payload: { peerId: myPeerId, name: userName }
@@ -342,6 +333,7 @@ const ClientApp = () => {
     setIsInRoom(false);
     setParticipants([]);
     setConnectionStatus('ready');
+    setRoomId('');
   };
 
   const toggleVideo = () => {
@@ -360,6 +352,20 @@ const ClientApp = () => {
     }
   };
 
+  const openSettings = () => {
+    setShowSettings(true);
+  };
+
+  const handleSelectLocation = (location) => {
+    setSelectedLocation(location);
+    localStorage.setItem('selectedLocation', JSON.stringify(location));
+    setShowSettings(false);
+  };
+
+  if (showSettings) {
+    return <LocationSettings onClose={() => setShowSettings(false)} onSelectLocation={handleSelectLocation} />;
+  }
+
   if (!isInRoom) {
     return (
       <div className="fixed inset-0 bg-gradient-to-br from-blue-100 to-cyan-100 flex items-center justify-center overflow-hidden">
@@ -373,9 +379,17 @@ const ClientApp = () => {
           <div className="mb-12 bg-blue-50 p-10 rounded-3xl border-4 border-blue-300 text-center">
             <Building2 className="w-32 h-32 text-blue-700 mx-auto mb-6" />
             <p className="text-4xl text-blue-800 font-medium mb-4">สถานที่ใช้งาน</p>
-            <p className="text-6xl font-bold text-blue-900">
-              {selectedLocation ? selectedLocation.name : 'กำลังโหลด...'}
+            <p className="text-6xl font-bold text-blue-900 mb-6">
+              {selectedLocation ? selectedLocation.name : 'ยังไม่ได้เลือกสถานที่'}
             </p>
+
+            <button
+              onClick={openSettings}
+              className="px-12 py-6 bg-blue-600 hover:bg-blue-700 text-white rounded-2xl text-3xl font-bold flex items-center gap-4 mx-auto shadow-xl"
+            >
+              <Settings className="w-12 h-12" />
+              ตั้งค่าสถานที่
+            </button>
           </div>
 
           <div className="mb-12">
@@ -478,7 +492,7 @@ const ClientApp = () => {
             {isAudioEnabled ? <Mic className="w-16 h-16 text-white" /> : <MicOff className="w-16 h-16 text-white" />}
           </button>
           <button onClick={() => leaveRoom(true)} className="px-12 py-8 bg-red-600 hover:bg-red-700 rounded-3xl flex items-center gap-6">
-            <LogOut className="w-16 h-16 text-white" />
+            <PhoneOff className="w-16 h-16 text-white" />
             <span className="text-white text-4xl font-bold">ออกจากห้อง</span>
           </button>
         </div>

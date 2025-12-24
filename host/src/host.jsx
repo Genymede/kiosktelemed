@@ -46,7 +46,7 @@ const HostApp = () => {
     }
   }, []);
 
-  // PeerJS initialization
+  // PeerJS initialization (สร้างครั้งเดียวตอน mount)
   useEffect(() => {
     const script = document.createElement('script');
     script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js';
@@ -55,15 +55,22 @@ const HostApp = () => {
     document.body.appendChild(script);
 
     return () => {
+      script.remove();
+      if (peerRef.current && !peerRef.current.destroyed) {
+        peerRef.current.destroy();
+      }
       cleanup();
     };
   }, []);
 
+  // อัปเดตวิดีโอ local ของ host เมื่อ stream พร้อม
   useEffect(() => {
-    if (isInRoom && localStreamRef.current && localVideoRef.current) {
+    if (localStreamRef.current && localVideoRef.current) {
       localVideoRef.current.srcObject = localStreamRef.current;
+      localVideoRef.current.muted = true;
+      localVideoRef.current.play().catch(e => console.warn('Host local video play error:', e));
     }
-  }, [isInRoom]);
+  }, [localStreamRef.current]);
 
   const initializePeer = () => {
     const peer = new window.Peer({
@@ -92,6 +99,7 @@ const HostApp = () => {
           localStreamRef.current = stream;
           if (localVideoRef.current) localVideoRef.current.srcObject = stream;
         } catch (err) {
+          console.error('Host getUserMedia error:', err);
           return;
         }
       }
@@ -106,6 +114,7 @@ const HostApp = () => {
     peer.on('connection', (conn) => setupDataConnection(conn));
 
     peer.on('error', (err) => {
+      console.error('Host Peer error:', err);
       if (err.type === 'peer-unavailable') setError('ไม่พบผู้ใช้ที่ต้องการเชื่อมต่อ');
       else setError('เกิดข้อผิดพลาด: ' + err.message);
     });
@@ -124,7 +133,7 @@ const HostApp = () => {
     switch (type) {
       case 'room-state':
         roomStateRef.current = payload;
-        setParticipants(payload.participants);
+        setParticipants(payload.participants || []);
         payload.participants.forEach(p => {
           if (p.peerId !== myPeerId && !callsRef.current[p.peerId]) {
             setTimeout(() => callPeer(p.peerId, p.name), 500);
@@ -139,9 +148,10 @@ const HostApp = () => {
         }
         break;
       case 'participant-left':
+        console.log('Received participant-left from:', payload.peerId);
         roomStateRef.current.participants = roomStateRef.current.participants.filter(p => p.peerId !== payload.peerId);
         setParticipants([...roomStateRef.current.participants]);
-        removeParticipant(payload.peerId);
+        removeParticipant(payload.peerId); // ลบทันที
         break;
       case 'host-leaving':
         setError('Host ปิดห้องแล้ว');
@@ -166,89 +176,83 @@ const HostApp = () => {
     setRoomId(id);
   };
 
-const joinOrCreateRoom = async () => {
-  if (!userName.trim()) {
-    setError('กรุณากรอกชื่อของคุณ');
-    return;
-  }
-  if (!selectedLocation) {
-    setError('กรุณาเลือกสถานที่');
-    return;
-  }
-  if (!roomId) {
-    setError('กรุณากรอกรหัสห้องหรือกดสร้าง');
-    return;
-  }
-
-  try {
-    setConnectionStatus('connecting');
-    setError('');
-
-    // เปิดกล้องทันที (สำหรับ Host)
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    localStreamRef.current = stream;
-    if (localVideoRef.current) {
-      localVideoRef.current.srcObject = stream;
-      localVideoRef.current.play().catch(e => console.warn('Local video play error:', e));
+  const joinOrCreateRoom = async () => {
+    if (!userName.trim()) {
+      setError('กรุณากรอกชื่อของคุณ');
+      return;
+    }
+    if (!selectedLocation) {
+      setError('กรุณาเลือกสถานที่');
+      return;
+    }
+    if (!roomId) {
+      setError('กรุณากรอกรหัสห้องหรือกดสร้าง');
+      return;
     }
 
-    const roomPath = `${selectedLocation.id}/rooms/${roomId}`;
-    const roomRef = ref(database, roomPath);
+    try {
+      setConnectionStatus('connecting');
+      setError('');
 
-    const snapshot = await get(roomRef);
-    const hostPeerId = snapshot.val()?.hostPeerId;
-
-    await set(roomRef, {
-      hostPeerId: myPeerId,
-      createdAt: Date.now(),
-      locationName: selectedLocation.name
-    });
-
-    roomStateRef.current = {
-      roomId,
-      hostPeerId: myPeerId,
-      participants: [{ peerId: myPeerId, name: userName, isHost: true }]
-    };
-
-    setIsInRoom(true);
-    setConnectionStatus('waiting');
-
-    roomHostListenerRef.current = roomRef;
-    onValue(roomRef, (snap) => {
-      if (!snap.exists() && isInRoom) {
-        setError('Host ปิดห้องแล้ว');
-        setTimeout(() => leaveRoom(false), 2000);
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+      if (localVideoRef.current) {
+        localVideoRef.current.srcObject = stream;
+        localVideoRef.current.play().catch(e => console.warn('Host local video play error:', e));
       }
-    });
 
-  } catch (err) {
-    console.error('Media error:', err);
-    setError('ไม่สามารถเปิดกล้องหรือไมโครโฟนได้: ' + err.message);
-    setConnectionStatus('ready');
-  }
+      const roomPath = `${selectedLocation.id}/rooms/${roomId}`;
+      const roomRef = ref(database, roomPath);
 
-  // บันทึก hostPeerId ทันทีหลัง peer พร้อม
-  const roomPath = `${selectedLocation.id}/rooms/${roomId}`;
-  const roomRef = ref(database, roomPath);
+      const snapshot = await get(roomRef);
+      const hostPeerId = snapshot.val()?.hostPeerId;
 
-  await set(roomRef, {
-    hostPeerId: myPeerId,
-    hostName: userName,
-    createdAt: Date.now(),
-    locationName: selectedLocation.name,
-    participants: {} // เริ่มต้นว่าง
-  });
+      await set(roomRef, {
+        hostPeerId: myPeerId,
+        hostName: userName,
+        createdAt: Date.now(),
+        locationName: selectedLocation.name,
+        participants: {}
+      });
 
-  // ฟังเมื่อมี client เข้ามาใหม่
-  onValue(ref(database, `${roomPath}/participants`), (snap) => {
-    const clients = snap.val() || {};
-    Object.keys(clients).forEach(clientPeerId => {
-      if (!callsRef.current[clientPeerId]) {
-        callPeer(clientPeerId, clients[clientPeerId].name);
-      }
-    });
-  });
-};
+      roomStateRef.current = {
+        roomId,
+        hostPeerId: myPeerId,
+        participants: [{ peerId: myPeerId, name: userName, isHost: true }]
+      };
+
+      setIsInRoom(true);
+      setConnectionStatus('waiting');
+
+      roomHostListenerRef.current = roomRef;
+      onValue(roomRef, (snap) => {
+        if (!snap.exists() && isInRoom) {
+          setError('Host ปิดห้องแล้ว');
+          setTimeout(() => leaveRoom(false), 2000);
+        }
+      });
+
+      // ฟัง participants จาก Firebase เพื่อ sync การลบ frame
+      const participantsRef = ref(database, `${roomPath}/participants`);
+      onValue(participantsRef, (snap) => {
+        const data = snap.val() || {};
+        const currentPeers = Object.keys(data);
+
+        // ลบ frame ที่ไม่อยู่ใน Firebase อีกต่อไป
+        Object.keys(callsRef.current).forEach(peerId => {
+          if (!currentPeers.includes(peerId) && peerId !== myPeerId) {
+            console.log('Sync remove from Firebase:', peerId);
+            removeParticipant(peerId);
+          }
+        });
+      });
+
+    } catch (err) {
+      console.error('Media error:', err);
+      setError('ไม่สามารถเปิดกล้องหรือไมโครโฟนได้: ' + err.message);
+      setConnectionStatus('ready');
+    }
+  };
 
   const callPeer = async (peerId, peerName) => {
     if (callsRef.current[peerId]) return;
@@ -260,7 +264,7 @@ const joinOrCreateRoom = async () => {
     callsRef.current[peerId] = call;
 
     call.on('stream', (remoteStream) => addRemoteStream(peerId, remoteStream, { name: peerName }));
-    call.on('close', () => delete callsRef.current[peerId]);
+    call.on('close', () => removeParticipant(peerId));
   };
 
   const addRemoteStream = (peerId, stream, metadata) => {
@@ -294,12 +298,24 @@ const joinOrCreateRoom = async () => {
   };
 
   const removeParticipant = (peerId) => {
+    console.log('Removing participant:', peerId);
     const wrapper = document.getElementById(`wrapper-${peerId}`);
-    if (wrapper) wrapper.remove();
-    if (callsRef.current[peerId]) callsRef.current[peerId].close();
-    delete callsRef.current[peerId];
-    if (dataConnectionsRef.current[peerId]) dataConnectionsRef.current[peerId].close();
-    delete dataConnectionsRef.current[peerId];
+    if (wrapper) {
+      wrapper.remove();
+      console.log('Wrapper removed for:', peerId);
+    } else {
+      console.warn('Wrapper not found for:', peerId);
+    }
+
+    if (callsRef.current[peerId]) {
+      callsRef.current[peerId].close();
+      delete callsRef.current[peerId];
+    }
+
+    if (dataConnectionsRef.current[peerId]) {
+      dataConnectionsRef.current[peerId].close();
+      delete dataConnectionsRef.current[peerId];
+    }
   };
 
   const cleanup = () => {
@@ -309,12 +325,11 @@ const joinOrCreateRoom = async () => {
     Object.values(callsRef.current).forEach(call => {
       if (call.close) call.close();
     });
+    callsRef.current = {};
     Object.values(dataConnectionsRef.current).forEach(conn => {
       if (conn.close) conn.close();
     });
-    if (peerRef.current && !peerRef.current.destroyed) {
-      peerRef.current.destroy();
-    }
+    dataConnectionsRef.current = {};
     if (roomHostListenerRef.current) {
       off(roomHostListenerRef.current);
       roomHostListenerRef.current = null;
