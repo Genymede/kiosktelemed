@@ -517,7 +517,7 @@ const HostApp = () => {
               <span className="text-white text-2xl font-medium">{userName} (คุณ)</span>
             </div>
           </div>
-          <div id="remote-videos" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8 contents"></div>
+          <div id="remote-videos" className="grid grid-cols-1 gap-8 contents"></div>
         </div>
       </div>
 

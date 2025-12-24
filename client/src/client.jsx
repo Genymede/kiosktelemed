@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useLayoutEffect } from 'react';
 import { Video, VideoOff, Mic, MicOff, PhoneOff, Users, LogOut, User, Building2, Settings } from 'lucide-react';
 
 import { database } from './firebase';
@@ -63,16 +63,86 @@ const ClientApp = () => {
     }
   }, [selectedLocation]);
 
-  // อัปเดตวิดีโอ local เมื่อ stream พร้อม
-  useEffect(() => {
-    if (localStreamRef.current && localVideoRef.current) {
-      localVideoRef.current.srcObject = localStreamRef.current;
-      localVideoRef.current.muted = true;
-      localVideoRef.current.play().catch(e => console.warn('Local video play error:', e));
+  // เปิดกล้องใน joinOrCreateRoom + รอพร้อมก่อน setIsInRoom
+  const joinOrCreateRoom = async (targetRoomId) => {
+    if (!userName.trim()) {
+      setError('กรุณากรอกชื่อของคุณ');
+      return;
     }
-  }, [localStreamRef.current]);
+    if (!selectedLocation) {
+      setError('ยังไม่ได้เลือกสถานที่');
+      return;
+    }
 
-  // PeerJS initialization - สร้างแค่ครั้งเดียวตอน mount
+    try {
+      setConnectionStatus('connecting');
+      setError('');
+
+      console.log('Opening camera before joining...');
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+
+      const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
+      const roomRef = ref(database, roomPath);
+
+      const snapshot = await get(roomRef);
+      const hostPeerId = snapshot.val()?.hostPeerId;
+
+      if (!hostPeerId) {
+        setError('ไม่พบห้องนี้หรือ Host ออกไปแล้ว');
+        setConnectionStatus('ready');
+        return;
+      }
+
+      await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
+        name: userName,
+        joinedAt: Date.now()
+      });
+
+      const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
+      setupDataConnection(dataConn);
+
+      console.log('Stream ready, calling host...');
+      callPeer(hostPeerId, 'Host');
+
+      setRoomId(targetRoomId);
+      setIsInRoom(true); // เข้าหน้าวิดีโอคอลหลังทุกอย่างพร้อม
+      setConnectionStatus('connected');
+
+      roomHostListenerRef.current = roomRef;
+      onValue(roomRef, (snap) => {
+        if (!snap.exists() && isInRoom) {
+          setError('Host ปิดห้องแล้ว');
+          setTimeout(() => leaveRoom(false), 2000);
+        }
+      });
+
+    } catch (err) {
+      console.error('Join error:', err);
+      setError('ไม่สามารถเข้าห้องได้: ' + (err.message || 'เกิดข้อผิดพลาด'));
+      setConnectionStatus('ready');
+    }
+  };
+
+  // set srcObject + play() ก่อน paint (แก้ timing issue)
+  useLayoutEffect(() => {
+    if (!isInRoom || !localStreamRef.current || !localVideoRef.current) return;
+
+    console.log('useLayoutEffect: Setting srcObject to local video');
+    const video = localVideoRef.current;
+    video.srcObject = localStreamRef.current;
+    video.muted = true;
+    video.playsInline = true;
+
+    video.onloadedmetadata = () => {
+      console.log('Local metadata loaded, starting play...');
+      video.play()
+        .then(() => console.log('Local video playing successfully'))
+        .catch(e => console.warn('Local video play failed:', e));
+    };
+  }, [isInRoom]);
+
+  // PeerJS initialization
   useEffect(() => {
     const script = document.createElement('script');
     script.src = 'https://cdn.jsdelivr.net/npm/peerjs@1.5.2/dist/peerjs.min.js';
@@ -80,14 +150,13 @@ const ClientApp = () => {
     script.onload = initializePeer;
     document.body.appendChild(script);
 
-    // Cleanup เฉพาะเมื่อ unmount (ไม่ destroy peer เมื่อออกห้อง)
     return () => {
       script.remove();
       if (peerRef.current && !peerRef.current.destroyed) {
         peerRef.current.destroy();
       }
     };
-  }, []); // [] = run once on mount
+  }, []);
 
   const initializePeer = () => {
     const peer = new window.Peer({
@@ -110,13 +179,13 @@ const ClientApp = () => {
     });
 
     peer.on('call', async (call) => {
+      console.log('Received call from:', call.peer);
       if (!localStreamRef.current) {
         try {
           const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
           localStreamRef.current = stream;
-          if (localVideoRef.current) localVideoRef.current.srcObject = stream;
         } catch (err) {
-          console.error('getUserMedia error:', err);
+          console.error('getUserMedia error in call:', err);
           setError('ไม่สามารถเปิดกล้อง/ไมค์ได้');
           return;
         }
@@ -125,7 +194,10 @@ const ClientApp = () => {
       call.answer(localStreamRef.current);
       callsRef.current[call.peer] = call;
 
-      call.on('stream', (remoteStream) => addRemoteStream(call.peer, remoteStream, call.metadata));
+      call.on('stream', (remoteStream) => {
+        console.log('Received remote stream from:', call.peer);
+        addRemoteStream(call.peer, remoteStream, call.metadata);
+      });
       call.on('close', () => removeParticipant(call.peer));
     });
 
@@ -178,79 +250,26 @@ const ClientApp = () => {
     }
   };
 
-  const joinOrCreateRoom = async (targetRoomId) => {
-    if (!userName.trim()) {
-      setError('กรุณากรอกชื่อของคุณ');
-      return;
-    }
-    if (!selectedLocation) {
-      setError('ยังไม่ได้เลือกสถานที่');
-      return;
-    }
-
-    try {
-      setConnectionStatus('connecting');
-      setError('');
-
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localStreamRef.current = stream;
-      if (localVideoRef.current) {
-        localVideoRef.current.srcObject = stream;
-        localVideoRef.current.play().catch(e => console.warn('Local video play error:', e));
-      }
-
-      const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
-      const roomRef = ref(database, roomPath);
-
-      const snapshot = await get(roomRef);
-      const hostPeerId = snapshot.val()?.hostPeerId;
-
-      if (!hostPeerId) {
-        setError('ไม่พบห้องนี้หรือ Host ออกไปแล้ว');
-        setConnectionStatus('ready');
-        return;
-      }
-
-      await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
-        name: userName,
-        joinedAt: Date.now()
-      });
-
-      const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
-      setupDataConnection(dataConn);
-
-      callPeer(hostPeerId, 'Host');
-
-      setRoomId(targetRoomId);
-
-      setIsInRoom(true);
-      setConnectionStatus('connected');
-
-      roomHostListenerRef.current = roomRef;
-      onValue(roomRef, (snap) => {
-        if (!snap.exists() && isInRoom) {
-          setError('Host ปิดห้องแล้ว');
-          setTimeout(() => leaveRoom(false), 2000);
-        }
-      });
-
-    } catch (err) {
-      console.error('Join error:', err);
-      setError('ไม่สามารถเข้าห้องได้: ' + err.message);
-      setConnectionStatus('ready');
-    }
-  };
-
   const callPeer = async (peerId, peerName) => {
     if (callsRef.current[peerId]) return;
 
+    if (!localStreamRef.current) {
+      console.error('No stream for call to', peerId);
+      setError('ไม่มี stream สำหรับโทร');
+      return;
+    }
+
     try {
+      console.log('Calling peer:', peerId);
       const call = peerRef.current.call(peerId, localStreamRef.current, {
         metadata: { name: userName }
       });
       callsRef.current[peerId] = call;
 
-      call.on('stream', (remoteStream) => addRemoteStream(peerId, remoteStream, { name: peerName }));
+      call.on('stream', (remoteStream) => {
+        console.log('Received remote stream from:', peerId);
+        addRemoteStream(peerId, remoteStream, { name: peerName });
+      });
       call.on('close', () => removeParticipant(peerId));
     } catch (err) {
       console.error('Call error:', err);
@@ -258,6 +277,7 @@ const ClientApp = () => {
   };
 
   const addRemoteStream = (peerId, stream, metadata) => {
+    console.log('Adding remote stream for:', peerId);
     const container = document.getElementById('remote-videos');
     if (!container) return;
 
@@ -283,11 +303,12 @@ const ClientApp = () => {
       container.appendChild(wrapper);
 
       videoElement.srcObject = stream;
-      videoElement.play().catch(e => console.warn("Play error:", e));
+      videoElement.play().catch(e => console.warn("Play error for remote:", e));
     }
   };
 
   const removeParticipant = (peerId) => {
+    console.log('Removing participant:', peerId);
     const wrapper = document.getElementById(`wrapper-${peerId}`);
     if (wrapper) wrapper.remove();
     if (callsRef.current[peerId]) callsRef.current[peerId].close();
@@ -297,19 +318,25 @@ const ClientApp = () => {
   };
 
   const cleanup = () => {
-    // ไม่ destroy peer ที่นี่ เพื่อให้ใช้ต่อได้ตอนเข้าใหม่
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop());
       localStreamRef.current = null;
     }
+
     Object.values(callsRef.current).forEach(call => {
-      if (call.close) call.close();
+      if (call && typeof call.close === 'function') {
+        call.close();
+      }
     });
     callsRef.current = {};
+
     Object.values(dataConnectionsRef.current).forEach(conn => {
-      if (conn.close) conn.close();
+      if (conn && typeof conn.close === 'function') {
+        conn.close();
+      }
     });
     dataConnectionsRef.current = {};
+
     if (roomHostListenerRef.current) {
       off(roomHostListenerRef.current);
       roomHostListenerRef.current = null;
@@ -474,12 +501,18 @@ const ClientApp = () => {
       <div className="flex-1 p-8 overflow-auto">
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8">
           <div className="relative bg-gray-800 rounded-3xl overflow-hidden shadow-2xl min-h-[400px]">
-            <video ref={localVideoRef} autoPlay playsInline muted className="w-full h-full object-cover mirror" />
+            <video 
+              ref={localVideoRef} 
+              autoPlay 
+              playsInline 
+              muted 
+              className="w-full h-full object-cover mirror" 
+            />
             <div className="absolute bottom-6 left-6 bg-black bg-opacity-70 px-6 py-3 rounded-2xl">
               <span className="text-white text-2xl font-medium">{userName} (คุณ)</span>
             </div>
           </div>
-          <div id="remote-videos" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-8 contents"></div>
+          <div id="remote-videos" className="grid grid-cols-1 gap-8 contents"></div>
         </div>
       </div>
 
@@ -501,4 +534,4 @@ const ClientApp = () => {
   );
 };
 
-export default ClientApp;
+export default ClientApp; 
