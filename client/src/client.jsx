@@ -63,68 +63,7 @@ const ClientApp = () => {
     }
   }, [selectedLocation]);
 
-  // เปิดกล้องใน joinOrCreateRoom + รอพร้อมก่อน setIsInRoom
-  const joinOrCreateRoom = async (targetRoomId) => {
-    if (!userName.trim()) {
-      setError('กรุณากรอกชื่อของคุณ');
-      return;
-    }
-    if (!selectedLocation) {
-      setError('ยังไม่ได้เลือกสถานที่');
-      return;
-    }
-
-    try {
-      setConnectionStatus('connecting');
-      setError('');
-
-      console.log('Opening camera before joining...');
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      localStreamRef.current = stream;
-
-      const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
-      const roomRef = ref(database, roomPath);
-
-      const snapshot = await get(roomRef);
-      const hostPeerId = snapshot.val()?.hostPeerId;
-
-      if (!hostPeerId) {
-        setError('ไม่พบห้องนี้หรือ Host ออกไปแล้ว');
-        setConnectionStatus('ready');
-        return;
-      }
-
-      await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
-        name: userName,
-        joinedAt: Date.now()
-      });
-
-      const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
-      setupDataConnection(dataConn);
-
-      console.log('Stream ready, calling host...');
-      callPeer(hostPeerId, 'Host');
-
-      setRoomId(targetRoomId);
-      setIsInRoom(true); // เข้าหน้าวิดีโอคอลหลังทุกอย่างพร้อม
-      setConnectionStatus('connected');
-
-      roomHostListenerRef.current = roomRef;
-      onValue(roomRef, (snap) => {
-        if (!snap.exists() && isInRoom) {
-          setError('Host ปิดห้องแล้ว');
-          setTimeout(() => leaveRoom(false), 2000);
-        }
-      });
-
-    } catch (err) {
-      console.error('Join error:', err);
-      setError('ไม่สามารถเข้าห้องได้: ' + (err.message || 'เกิดข้อผิดพลาด'));
-      setConnectionStatus('ready');
-    }
-  };
-
-  // set srcObject + play() ก่อน paint (แก้ timing issue)
+  // set srcObject + play() ก่อน paint
   useLayoutEffect(() => {
     if (!isInRoom || !localStreamRef.current || !localVideoRef.current) return;
 
@@ -250,6 +189,66 @@ const ClientApp = () => {
     }
   };
 
+  const joinOrCreateRoom = async (targetRoomId) => {
+    if (!userName.trim()) {
+      setError('กรุณากรอกชื่อของคุณ');
+      return;
+    }
+    if (!selectedLocation) {
+      setError('ยังไม่ได้เลือกสถานที่');
+      return;
+    }
+
+    try {
+      setConnectionStatus('connecting');
+      setError('');
+
+      console.log('Opening camera before joining...');
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localStreamRef.current = stream;
+
+      const roomPath = `${selectedLocation.id}/rooms/${targetRoomId}`;
+      const roomRef = ref(database, roomPath);
+
+      const snapshot = await get(roomRef);
+      const hostPeerId = snapshot.val()?.hostPeerId;
+
+      if (!hostPeerId) {
+        setError('ไม่พบห้องนี้หรือ Host ออกไปแล้ว');
+        setConnectionStatus('ready');
+        return;
+      }
+
+      await set(ref(database, `${roomPath}/participants/${myPeerId}`), {
+        name: userName,
+        joinedAt: Date.now()
+      });
+
+      const dataConn = peerRef.current.connect(hostPeerId, { reliable: true });
+      setupDataConnection(dataConn);
+
+      console.log('Stream ready, calling host...');
+      callPeer(hostPeerId, 'Host');
+
+      setRoomId(targetRoomId);
+      setIsInRoom(true);
+      setConnectionStatus('connected');
+
+      roomHostListenerRef.current = roomRef;
+      onValue(roomRef, (snap) => {
+        if (!snap.exists() && isInRoom) {
+          setError('Host ปิดห้องแล้ว');
+          setTimeout(() => leaveRoom(false), 2000);
+        }
+      });
+
+    } catch (err) {
+      console.error('Join error:', err);
+      setError('ไม่สามารถเข้าห้องได้: ' + (err.message || 'เกิดข้อผิดพลาด'));
+      setConnectionStatus('ready');
+    }
+  };
+
   const callPeer = async (peerId, peerName) => {
     if (callsRef.current[peerId]) return;
 
@@ -345,17 +344,32 @@ const ClientApp = () => {
 
   const leaveRoom = async (notifyOthers = true) => {
     if (notifyOthers && roomId && selectedLocation && myPeerId) {
+      // 1. ปิดกล้องและไมค์ก่อน
+      if (localStreamRef.current) {
+        console.log('Stopping local camera and microphone...');
+        localStreamRef.current.getTracks().forEach(track => track.stop());
+        localStreamRef.current = null;
+
+        // ล้างวิดีโอจาก element
+        if (localVideoRef.current) {
+          localVideoRef.current.srcObject = null;
+        }
+      }
+
+      // 2. ลบตัวเองออกจาก Firebase
       const roomPath = `${selectedLocation.id}/rooms/${roomId}`;
       const participantRef = ref(database, `${roomPath}/participants/${myPeerId}`);
       await remove(participantRef).catch(err => console.error('Failed to remove participant:', err));
 
+      // 3. ส่งแจ้ง host
       sendToHost({
         type: 'participant-left',
         payload: { peerId: myPeerId, name: userName }
       });
-    }
 
-    cleanup();
+      // 4. ปิด connection อื่น ๆ
+      cleanup();
+    }
 
     setIsInRoom(false);
     setParticipants([]);
@@ -464,10 +478,7 @@ const ClientApp = () => {
     <div className="fixed inset-0 bg-gray-900 flex flex-col">
       <div className="absolute top-6 right-6 z-50">
         <button
-          onClick={() => {
-            leaveRoom(true);
-            window.location.href = 'about:blank';
-          }}
+          onClick={() => leaveRoom(true)}
           className="w-20 h-20 bg-red-600 hover:bg-red-700 rounded-full shadow-2xl flex items-center justify-center transition-all"
         >
           <svg className="w-12 h-12 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -534,4 +545,4 @@ const ClientApp = () => {
   );
 };
 
-export default ClientApp; 
+export default ClientApp;
